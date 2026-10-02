@@ -94,12 +94,23 @@
   </main>
 
   <script type="module">
-    import * as Y from 'https://esm.sh/yjs@13.6.18'
-    import { WebrtcProvider } from 'https://esm.sh/y-webrtc@10.3.0'
+    // Server-mediated sync (MQTT over WebSocket on public brokers).
+    // WebRTC was dropped: school/NAT networks never joined the same peer mesh,
+    // so each browser kept a private lock. These brokers relay one retained
+    // JSON snapshot. v2 topic so old y-webrtc rooms cannot collide.
+    import mqtt from 'https://cdn.jsdelivr.net/npm/mqtt@5.16.0/dist/mqtt.esm.js'
 
-    const ROOM = 'verity-procreate-animation-turn-v1'
+    const TOPIC = 'jaydenng0807/procreate-turn/verity-procreate-animation-turn-v2'
     const STALE_MS = 45000
     const HEARTBEAT_MS = 8000
+    const BROKERS = [
+      { url: 'wss://demo.tbmq.io/mqtt', username: 'demo' },
+      { url: 'wss://iot.coreflux.cloud/mqtt' },
+      { url: 'wss://broker.emqx.io:8084/mqtt' }
+    ]
+
+    const connect = mqtt.connect || (mqtt.default && mqtt.default.connect)
+    if (!connect) throw new Error('MQTT client failed to load')
 
     const btn = document.getElementById('lockBtn')
     const statusEl = document.getElementById('status')
@@ -118,36 +129,97 @@
     localStorage.setItem('turnName', myName)
     whoamiEl.textContent = myName
 
-    const ydoc = new Y.Doc()
-    const ylock = ydoc.getMap('lock')
-    const provider = new WebrtcProvider(ROOM, ydoc, {
-      signaling: [
-        'wss://signaling.yjs.dev',
-        'wss://y-webrtc-signaling-eu.herokuapp.com',
-        'wss://y-webrtc-signaling-us.herokuapp.com'
-      ]
-    })
+    function emptyLock() {
+      return { held: false, holderId: '', holderName: '', heartbeat: 0, takeId: '', claimedAt: 0, rev: 0 }
+    }
+
+    let state = emptyLock()
+    let canonical = ''
+    let forwardTimer = 0
+    const clients = []
 
     function now() { return Date.now() }
 
-    function readLock() {
-      const held = !!ylock.get('held')
-      const holderId = ylock.get('holderId') || null
-      const holderName = ylock.get('holderName') || 'Someone'
-      const heartbeat = Number(ylock.get('heartbeat') || 0)
-      return { held, holderId, holderName, heartbeat }
+    function isStale(lock) {
+      if (!lock || !lock.held) return false
+      if (!lock.heartbeat) return true
+      return now() - lock.heartbeat > STALE_MS
     }
 
-    function isStale(lock) {
-      return lock.held && lock.heartbeat && (now() - lock.heartbeat > STALE_MS)
+    function compareClaim(a, b) {
+      const ac = Number(a.claimedAt) || 0
+      const bc = Number(b.claimedAt) || 0
+      if (ac !== bc) return ac - bc
+      const at = String(a.takeId || '')
+      const bt = String(b.takeId || '')
+      if (at === bt) return 0
+      return at > bt ? 1 : -1
+    }
+
+    function freeFrom(next) {
+      return {
+        held: false,
+        holderId: '',
+        holderName: '',
+        heartbeat: 0,
+        takeId: next.takeId || '',
+        claimedAt: Number(next.claimedAt) || 0,
+        rev: Number(next.rev) || now()
+      }
+    }
+
+    function apply(next) {
+      if (!next || typeof next.held !== 'boolean') return
+      if (typeof next.rev !== 'number') next.rev = Number(next.heartbeat) || Number(next.claimedAt) || 0
+
+      if (!next.held) {
+        if (state.held && next.takeId && next.takeId === state.takeId) {
+          state = freeFrom(next)
+        } else if (!state.held && next.rev > (state.rev || 0)) {
+          state = freeFrom(next)
+        }
+        return
+      }
+
+      if (!state.held) {
+        if (next.rev <= (state.rev || 0)) return
+        state = next
+        return
+      }
+
+      if (next.takeId && next.takeId === state.takeId) {
+        if ((Number(next.heartbeat) || 0) >= (Number(state.heartbeat) || 0)) state = next
+        return
+      }
+
+      if (isStale(state) && !isStale(next)) {
+        state = next
+        return
+      }
+
+      if (compareClaim(next, state) > 0) state = next
+    }
+
+    function connectedCount() {
+      return clients.reduce((n, c) => n + (c.connected ? 1 : 0), 0)
     }
 
     function render() {
-      const lock = readLock()
-      const mine = lock.held && lock.holderId === myId
+      const lock = state
+      const mine = lock.held && lock.holderId === myId && !isStale(lock)
       const busyOther = lock.held && lock.holderId !== myId && !isStale(lock)
+      const online = connectedCount() > 0
 
       btn.classList.remove('busy', 'yours')
+      syncDot.classList.toggle('on', online)
+      syncText.textContent = online ? 'Live' : 'Connecting'
+
+      if (!online && !mine) {
+        btn.textContent = 'Animation'
+        btn.disabled = true
+        statusEl.textContent = 'Connecting to the shared turn…'
+        return
+      }
 
       if (mine) {
         btn.textContent = 'Release Animation'
@@ -158,69 +230,128 @@
         btn.textContent = 'animation in use'
         btn.classList.add('busy')
         btn.disabled = true
-        statusEl.textContent = `${lock.holderName} is animating.`
+        statusEl.textContent = `${lock.holderName || 'Someone'} is animating.`
       } else {
-        // free or stale
         btn.textContent = 'Animation'
-        btn.disabled = false
+        btn.disabled = !online
         statusEl.textContent = isStale(lock)
           ? 'Previous turn timed out — free to take.'
           : 'Free — click to take the animation turn.'
       }
     }
 
+    function forward(payload) {
+      for (const c of clients) {
+        if (c.connected) c.publish(TOPIC, payload, { qos: 1, retain: true })
+      }
+    }
+
+    function scheduleForward() {
+      clearTimeout(forwardTimer)
+      forwardTimer = setTimeout(() => {
+        if (canonical) forward(canonical)
+      }, 400)
+    }
+
+    function commit(next) {
+      clearTimeout(forwardTimer)
+      state = next
+      canonical = JSON.stringify(state)
+      forward(canonical)
+      render()
+    }
+
+    function onMessage(raw) {
+      if (!raw || raw === canonical) return
+      let next
+      try { next = JSON.parse(raw) } catch { return }
+      const before = JSON.stringify(state)
+      apply(next)
+      const after = JSON.stringify(state)
+      if (after !== before) {
+        canonical = after
+        render()
+        scheduleForward()
+      } else if (canonical) {
+        scheduleForward()
+      }
+    }
+
     function take() {
-      const lock = readLock()
-      if (lock.held && lock.holderId !== myId && !isStale(lock)) return
-      ydoc.transact(() => {
-        ylock.set('held', true)
-        ylock.set('holderId', myId)
-        ylock.set('holderName', myName)
-        ylock.set('heartbeat', now())
+      if (connectedCount() === 0) return
+      if (state.held && state.holderId !== myId && !isStale(state)) return
+      const t = now()
+      commit({
+        held: true,
+        holderId: myId,
+        holderName: myName,
+        heartbeat: t,
+        takeId: crypto.randomUUID(),
+        claimedAt: t,
+        rev: t
       })
     }
 
     function release() {
-      const lock = readLock()
-      if (lock.holderId !== myId) return
-      ydoc.transact(() => {
-        ylock.set('held', false)
-        ylock.set('holderId', '')
-        ylock.set('holderName', '')
-        ylock.set('heartbeat', 0)
+      if (state.holderId !== myId) return
+      const t = now()
+      commit({
+        held: false,
+        holderId: '',
+        holderName: '',
+        heartbeat: 0,
+        takeId: state.takeId,
+        claimedAt: state.claimedAt,
+        rev: t
       })
     }
 
     btn.addEventListener('click', () => {
-      const lock = readLock()
-      if (lock.held && lock.holderId === myId) release()
+      if (state.held && state.holderId === myId && !isStale(state)) release()
       else take()
     })
 
-    ylock.observe(render)
-    provider.on('status', (e) => {
-      const connected = e.status === 'connected'
-      syncDot.classList.toggle('on', connected)
-      syncText.textContent = connected ? 'Live' : 'Connecting'
+    const suffix = Math.random().toString(36).slice(2, 10)
+    BROKERS.forEach((broker, i) => {
+      const opts = {
+        clientId: 'pt' + suffix + i,
+        clean: true,
+        reconnectPeriod: 3000,
+        connectTimeout: 8000,
+        keepalive: 30,
+        protocolVersion: 4
+      }
+      if (broker.username) opts.username = broker.username
+      const client = connect(broker.url, opts)
+      clients.push(client)
+      client.on('connect', () => {
+        client.subscribe(TOPIC, { qos: 1 }, () => {
+          // Let retained snapshots arrive, then re-publish the newest one
+          // so a broker that missed a release/take catches up.
+          if (canonical) scheduleForward()
+          render()
+        })
+      })
+      client.on('message', (_topic, payload) => {
+        const raw = typeof payload === 'string' ? payload : new TextDecoder().decode(payload)
+        onMessage(raw)
+      })
+      client.on('reconnect', render)
+      client.on('close', render)
+      client.on('offline', render)
+      client.on('error', () => {})
     })
 
-    // heartbeat while I hold
     setInterval(() => {
-      const lock = readLock()
-      if (lock.held && lock.holderId === myId) {
-        ylock.set('heartbeat', now())
+      if (state.held && state.holderId === myId) {
+        const t = now()
+        commit({ ...state, heartbeat: t, rev: t })
       }
-      // if someone else's lock went stale, refresh UI so others can claim
       render()
     }, HEARTBEAT_MS)
 
-    // release if tab closes while I hold
-    window.addEventListener('beforeunload', () => {
-      const lock = readLock()
-      if (lock.held && lock.holderId === myId) {
-        // best-effort; may not always flush
-        release()
-      }
+    window.addEventListener('pagehide', () => {
+      if (state.held && state.holderId === myId) release()
     })
 
     render()
