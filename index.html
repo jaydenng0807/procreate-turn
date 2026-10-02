@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Procreate Turn Lock</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --card: #1a1d24;
+      --text: #f4f4f5;
+      --muted: #a1a1aa;
+      --free: #22c55e;
+      --busy: #ef4444;
+      --you: #3b82f6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 50% -10%, #1e293b 0%, var(--bg) 55%);
+      color: var(--text);
+      padding: 24px;
+    }
+    .wrap {
+      width: min(420px, 100%);
+      background: var(--card);
+      border: 1px solid #2a2f3a;
+      border-radius: 20px;
+      padding: 28px 24px 22px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.35);
+      text-align: center;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 1.25rem;
+      font-weight: 650;
+      letter-spacing: .01em;
+    }
+    p {
+      margin: 0 0 22px;
+      color: var(--muted);
+      font-size: .95rem;
+      line-height: 1.45;
+    }
+    button#lockBtn {
+      width: 100%;
+      border: 0;
+      border-radius: 14px;
+      padding: 18px 16px;
+      font-size: 1.15rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform .08s ease, opacity .15s ease, background .15s ease;
+      color: white;
+      background: var(--free);
+    }
+    button#lockBtn:active:not(:disabled) { transform: scale(.98); }
+    button#lockBtn.busy { background: var(--busy); cursor: not-allowed; }
+    button#lockBtn.yours { background: var(--you); cursor: pointer; }
+    button#lockBtn:disabled { opacity: .95; }
+    .status {
+      margin-top: 16px;
+      font-size: .9rem;
+      color: var(--muted);
+      min-height: 1.3em;
+    }
+    .meta {
+      margin-top: 14px;
+      font-size: .8rem;
+      color: #71717a;
+    }
+    .dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+      background: #71717a;
+      vertical-align: middle;
+    }
+    .dot.on { background: #22c55e; box-shadow: 0 0 0 3px rgba(34,197,94,.2); }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>Procreate turn lock</h1>
+    <p>Click <strong>Animation</strong> to take the turn. Others see “animation in use” until you release it.</p>
+    <button id="lockBtn" type="button">Animation</button>
+    <div class="status" id="status">Connecting…</div>
+    <div class="meta"><span class="dot" id="syncDot"></span><span id="syncText">Syncing</span> · you are <span id="whoami">…</span></div>
+  </main>
+
+  <script type="module">
+    import * as Y from 'https://esm.sh/yjs@13.6.18'
+    import { WebrtcProvider } from 'https://esm.sh/y-webrtc@10.3.0'
+
+    const ROOM = 'verity-procreate-animation-turn-v1'
+    const STALE_MS = 45000
+    const HEARTBEAT_MS = 8000
+
+    const btn = document.getElementById('lockBtn')
+    const statusEl = document.getElementById('status')
+    const whoamiEl = document.getElementById('whoami')
+    const syncDot = document.getElementById('syncDot')
+    const syncText = document.getElementById('syncText')
+
+    const adjectives = ['Swift','Quiet','Bold','Lucky','Pixel','Nova','Ink','Coral','Mint','Amber']
+    const nouns = ['Fox','Owl','Bear','Koala','Finch','Moth','Lynx','Puffin','Otter','Crane']
+    function randomName() {
+      return adjectives[Math.floor(Math.random()*adjectives.length)] + ' ' + nouns[Math.floor(Math.random()*nouns.length)]
+    }
+
+    const myId = crypto.randomUUID()
+    const myName = localStorage.getItem('turnName') || randomName()
+    localStorage.setItem('turnName', myName)
+    whoamiEl.textContent = myName
+
+    const ydoc = new Y.Doc()
+    const ylock = ydoc.getMap('lock')
+    const provider = new WebrtcProvider(ROOM, ydoc, {
+      signaling: [
+        'wss://signaling.yjs.dev',
+        'wss://y-webrtc-signaling-eu.herokuapp.com',
+        'wss://y-webrtc-signaling-us.herokuapp.com'
+      ]
+    })
+
+    function now() { return Date.now() }
+
+    function readLock() {
+      const held = !!ylock.get('held')
+      const holderId = ylock.get('holderId') || null
+      const holderName = ylock.get('holderName') || 'Someone'
+      const heartbeat = Number(ylock.get('heartbeat') || 0)
+      return { held, holderId, holderName, heartbeat }
+    }
+
+    function isStale(lock) {
+      return lock.held && lock.heartbeat && (now() - lock.heartbeat > STALE_MS)
+    }
+
+    function render() {
+      const lock = readLock()
+      const mine = lock.held && lock.holderId === myId
+      const busyOther = lock.held && lock.holderId !== myId && !isStale(lock)
+
+      btn.classList.remove('busy', 'yours')
+
+      if (mine) {
+        btn.textContent = 'Release Animation'
+        btn.classList.add('yours')
+        btn.disabled = false
+        statusEl.textContent = 'You are animating — click again to free the turn.'
+      } else if (busyOther) {
+        btn.textContent = 'animation in use'
+        btn.classList.add('busy')
+        btn.disabled = true
+        statusEl.textContent = `${lock.holderName} is animating.`
+      } else {
+        // free or stale
+        btn.textContent = 'Animation'
+        btn.disabled = false
+        statusEl.textContent = isStale(lock)
+          ? 'Previous turn timed out — free to take.'
+          : 'Free — click to take the animation turn.'
+      }
+    }
+
+    function take() {
+      const lock = readLock()
+      if (lock.held && lock.holderId !== myId && !isStale(lock)) return
+      ydoc.transact(() => {
+        ylock.set('held', true)
+        ylock.set('holderId', myId)
+        ylock.set('holderName', myName)
+        ylock.set('heartbeat', now())
+      })
+    }
+
+    function release() {
+      const lock = readLock()
+      if (lock.holderId !== myId) return
+      ydoc.transact(() => {
+        ylock.set('held', false)
+        ylock.set('holderId', '')
+        ylock.set('holderName', '')
+        ylock.set('heartbeat', 0)
+      })
+    }
+
+    btn.addEventListener('click', () => {
+      const lock = readLock()
+      if (lock.held && lock.holderId === myId) release()
+      else take()
+    })
+
+    ylock.observe(render)
+    provider.on('status', (e) => {
+      const connected = e.status === 'connected'
+      syncDot.classList.toggle('on', connected)
+      syncText.textContent = connected ? 'Live' : 'Connecting'
+    })
+
+    // heartbeat while I hold
+    setInterval(() => {
+      const lock = readLock()
+      if (lock.held && lock.holderId === myId) {
+        ylock.set('heartbeat', now())
+      }
+      // if someone else's lock went stale, refresh UI so others can claim
+      render()
+    }, HEARTBEAT_MS)
+
+    // release if tab closes while I hold
+    window.addEventListener('beforeunload', () => {
+      const lock = readLock()
+      if (lock.held && lock.holderId === myId) {
+        // best-effort; may not always flush
+        release()
+      }
+    })
+
+    render()
+  </script>
+</body>
+</html>
